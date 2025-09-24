@@ -5,8 +5,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 from vector import initialize_vector_store
+from langchain_ollama import OllamaEmbeddings
 import pandas as pd
-from difflib import get_close_matches
+import numpy as np
 
 app = Flask(__name__)
 CORS(app)
@@ -19,6 +20,17 @@ except FileNotFoundError:
     df = None
     print(f"❌ CSV file '{CSV_FILE}' not found. Exact/fuzzy matching disabled.")
 
+# Initialize embeddings for semantic fuzzy
+embeddings_model = OllamaEmbeddings(model="nomic-embed-text")
+
+# Precompute embeddings for all CSV questions
+question_embeddings = []
+if df is not None:
+    print("✅ Precomputing embeddings for all CSV questions...")
+    for _, row in df.iterrows():
+        emb = embeddings_model.embed_query(row["Question"])
+        question_embeddings.append((row["Question"], row["Answer"], emb))
+
 
 # ---------- Matching Helpers ----------
 def check_exact_match(user_message: str):
@@ -30,15 +42,26 @@ def check_exact_match(user_message: str):
     return None
 
 
-def check_fuzzy_match(user_message: str, cutoff=0.7):
-    """Check for approximate string match in CSV questions."""
-    if df is not None:
-        questions = df["Question"].str.lower().tolist()
-        matches = get_close_matches(user_message.lower(), questions, n=1, cutoff=cutoff)
-        if matches:
-            matched_row = df[df["Question"].str.lower() == matches[0]]
-            if not matched_row.empty:
-                return matched_row.iloc[0]["Answer"]
+def semantic_fuzzy_match(user_message: str, threshold=0.6):
+    """Semantic similarity check against CSV questions."""
+    if not question_embeddings:
+        return None
+
+    query_embedding = embeddings_model.embed_query(user_message)
+
+    best_score = 0
+    best_answer = None
+
+    for q, a, emb in question_embeddings:
+        score = np.dot(query_embedding, emb) / (
+            np.linalg.norm(query_embedding) * np.linalg.norm(emb)
+        )
+        if score > best_score:
+            best_score = score
+            best_answer = a
+
+    if best_score >= threshold:
+        return best_answer
     return None
 
 
@@ -64,8 +87,9 @@ def initialize_rag_pipeline():
         Question: {input}
         """)
 
-        # Load LLM (choose a lightweight model for speed)
-        llm = ChatOllama(model="gemma:2b")   # very fast, good for Q&A
+        # Load LLM (lightweight)
+        llm = ChatOllama(model="gemma:2b")  # ✅ fast & fits 8GB RAM
+        # Alternative: llm = ChatOllama(model="mistral")
 
         # Build chain
         document_chain = create_stuff_documents_chain(llm, prompt_template)
@@ -100,17 +124,17 @@ def chat():
     # 1. Exact Match
     answer = check_exact_match(user_message)
     if answer:
-        return jsonify({"response": answer})
+        return jsonify({"response": answer + " (✅ Exact Match)"})
 
-    # 2. Fuzzy Match
-    fuzzy_answer = check_fuzzy_match(user_message)
+    # 2. Semantic Fuzzy Match
+    fuzzy_answer = semantic_fuzzy_match(user_message)
     if fuzzy_answer:
-        return jsonify({"response": fuzzy_answer})
+        return jsonify({"response": fuzzy_answer + " (✅ Semantic Fuzzy Match)"})
 
-    # 3. Semantic Match via RAG
+    # 3. Semantic Retrieval (RAG)
     try:
         response = retrieval_chain.invoke({"input": user_message})
-        return jsonify({"response": response["answer"]})
+        return jsonify({"response": response["answer"] + " (🤖 Semantic Retrieval)"})
     except Exception as e:
         return jsonify({"response": f"❌ An error occurred: {e}"})
 
