@@ -18,23 +18,22 @@ try:
     df = pd.read_csv(CSV_FILE)
 except FileNotFoundError:
     df = None
-    print(f"❌ CSV file '{CSV_FILE}' not found. Exact/fuzzy matching disabled.")
+    print(f"⚠️ CSV file '{CSV_FILE}' not found. Exact/fuzzy matching disabled.")
 
-# Initialize embeddings for semantic fuzzy
+# Embeddings for fuzzy matching
 embeddings_model = OllamaEmbeddings(model="nomic-embed-text")
 
 # Precompute embeddings for all CSV questions
 question_embeddings = []
 if df is not None:
-    print("✅ Precomputing embeddings for all CSV questions...")
+    print("✅ Precomputing embeddings for CSV questions...")
     for _, row in df.iterrows():
         emb = embeddings_model.embed_query(row["Question"])
         question_embeddings.append((row["Question"], row["Answer"], emb))
 
 
-# ---------- Matching Helpers ----------
+# ---------- CSV Matching Helpers ----------
 def check_exact_match(user_message: str):
-    """Check if the question matches exactly in CSV."""
     if df is not None:
         row = df[df["Question"].str.lower().str.strip() == user_message.lower().strip()]
         if not row.empty:
@@ -42,8 +41,7 @@ def check_exact_match(user_message: str):
     return None
 
 
-def semantic_fuzzy_match(user_message: str, threshold=0.6):
-    """Semantic similarity check against CSV questions."""
+def semantic_fuzzy_match(user_message: str, threshold=0.8):
     if not question_embeddings:
         return None
 
@@ -68,41 +66,38 @@ def semantic_fuzzy_match(user_message: str, threshold=0.6):
 # ---------- RAG Pipeline ----------
 def initialize_rag_pipeline():
     try:
-        # Load vector store & retriever
         vector_store = initialize_vector_store()
         retriever = vector_store.as_retriever(
             search_type="similarity_score_threshold",
-            search_kwargs={"k": 3, "score_threshold": 0.4}
+            search_kwargs={"k": 3, "score_threshold": 0.2}  # relaxed threshold
         )
 
-        # Prompt template
         prompt_template = ChatPromptTemplate.from_template("""
-        You are an expert in answering questions about facility management.
-        Use ONLY the following context to answer the question.
-        If the answer is not in the context,
-        you MUST say: "I cannot find the answer to that question in the provided documents."
+        You are an expert in facility management and safety manuals.
+
+        Use ONLY the provided context to answer the question.
+
+        - If the answer includes technical values (like pressure, temperature, size), extract them exactly as shown.
+        - If multiple values are present, list them clearly.
+        - If the answer truly is not present, reply: "I cannot find the answer in the provided documents."
 
         Context: {context}
 
         Question: {input}
         """)
 
-        # Load LLM (lightweight)
-        llm = ChatOllama(model="gemma:2b")  # ✅ fast & fits 8GB RAM
-        # Alternative: llm = ChatOllama(model="mistral")
 
-        # Build chain
+        llm = ChatOllama(model="gemma:2b")
+
         document_chain = create_stuff_documents_chain(llm, prompt_template)
         retrieval_chain = create_retrieval_chain(retriever, document_chain)
 
         return retrieval_chain
-
     except Exception as e:
         print(f"❌ Error initializing RAG pipeline: {e}")
         return None
 
 
-# Initialize RAG pipeline once
 retrieval_chain = initialize_rag_pipeline()
 
 
@@ -121,20 +116,28 @@ def chat():
     if not user_message:
         return jsonify({"response": "No message received."})
 
-    # 1. Exact Match
+    # 1. Exact Match (CSV)
     answer = check_exact_match(user_message)
     if answer:
-        return jsonify({"response": answer + " (✅ Exact Match)"})
+        return jsonify({"response": answer + " (✅ CSV Exact)"})
 
-    # 2. Semantic Fuzzy Match
-    fuzzy_answer = semantic_fuzzy_match(user_message)
+    # 2. Fuzzy Match (CSV)
+    fuzzy_answer = semantic_fuzzy_match(user_message, threshold=0.8)
     if fuzzy_answer:
-        return jsonify({"response": fuzzy_answer + " (✅ Semantic Fuzzy Match)"})
+        return jsonify({"response": fuzzy_answer + " (✅ CSV Fuzzy)"})
 
-    # 3. Semantic Retrieval (RAG)
+    # 3. RAG (CSV + PDFs)
     try:
         response = retrieval_chain.invoke({"input": user_message})
-        return jsonify({"response": response["answer"] + " (🤖 Semantic Retrieval)"})
+
+        # 🔎 Debug: print retrieved context in logs
+        print("🔎 Retrieved context:")
+        if "context" in response:
+            print(response["context"])
+        else:
+            print("No context returned")
+
+        return jsonify({"response": response["answer"] + " (📄 RAG: CSV+PDF)"})
     except Exception as e:
         return jsonify({"response": f"❌ An error occurred: {e}"})
 
