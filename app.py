@@ -105,7 +105,7 @@ Question:
 Answer:
 """)
 
-        llm = ChatOllama(model="gemma:7b")
+        llm = ChatOllama(model="gemma:7b-text-q4_1")
         document_chain = create_stuff_documents_chain(llm, prompt_template)
         retrieval_chain = create_retrieval_chain(retriever, document_chain)
         return retrieval_chain
