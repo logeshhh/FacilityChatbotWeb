@@ -105,7 +105,7 @@ Question:
 Answer:
 """)
 
-        llm = ChatOllama(model="gemma:2b", temperature=0.1)
+        llm = ChatOllama(model="mistral:7b-instruct-q2_K", temperature=0.1)
         document_chain = create_stuff_documents_chain(llm, prompt_template)
         retrieval_chain = create_retrieval_chain(retriever, document_chain)
         return retrieval_chain
