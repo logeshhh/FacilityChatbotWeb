@@ -105,7 +105,7 @@ Question:
 Answer:
 """)
 
-        llm = ChatOllama(model="gemma:7b-text-q4_1")
+        llm = ChatOllama(model="gemma:2b", temperature=0.1)
         document_chain = create_stuff_documents_chain(llm, prompt_template)
         retrieval_chain = create_retrieval_chain(retriever, document_chain)
         return retrieval_chain
@@ -135,12 +135,12 @@ def chat():
     # 1. Exact Match (CSV)
     answer = check_exact_match(user_message)
     if answer:
-        return jsonify({"response": answer + " (✅ CSV Exact)"})
+        return jsonify({"response": answer })
 
     # 2. Fuzzy Match (CSV)
     fuzzy_answer = semantic_fuzzy_match(user_message, threshold=0.8)
     if fuzzy_answer:
-        return jsonify({"response": fuzzy_answer + " (✅ CSV Fuzzy)"})
+        return jsonify({"response": fuzzy_answer })
 
     # 3. RAG (PDFs + CSV)
     try:
