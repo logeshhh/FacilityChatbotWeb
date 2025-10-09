@@ -1,11 +1,11 @@
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-from langchain_ollama import ChatOllama   # ✅ Updated import
+from langchain_ollama import ChatOllama   # ✅ LLM via Ollama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 from vector import initialize_vector_store
-from langchain_ollama import OllamaEmbeddings   # ✅ Keep embeddings import updated
+from langchain_huggingface import HuggingFaceEmbeddings  # ✅ MiniLM Embeddings
 import pandas as pd
 import numpy as np
 
@@ -21,7 +21,8 @@ except FileNotFoundError:
     print(f"⚠️ CSV file '{CSV_FILE}' not found. Exact/fuzzy matching disabled.")
 
 # ----------------- Embeddings for fuzzy matching -----------------
-embeddings_model = OllamaEmbeddings(model="nomic-embed-text")
+# ✅ Use HuggingFace MiniLM instead of sentence-transformers
+embeddings_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 # Precompute embeddings for CSV Q&A
 question_embeddings = []
@@ -61,7 +62,6 @@ def semantic_fuzzy_match(user_message: str, threshold=0.8):
 
 # ----------------- Question Normalization Helper -----------------
 def normalize_question(q: str) -> str:
-    """Normalize layman-style questions into retrieval-friendly forms."""
     replacements = {
         "know when to": "how does it",
         "why do": "what is the reason",
@@ -81,20 +81,19 @@ def initialize_rag_pipeline():
         vector_store = initialize_vector_store()
         retriever = vector_store.as_retriever(
             search_type="similarity_score_threshold",
-            search_kwargs={"k": 4, "score_threshold": 0.1},  # ✅ Lower threshold, more robust
+            search_kwargs={"k": 4, "score_threshold": 0.1},
         )
 
         prompt_template = ChatPromptTemplate.from_template("""
-You are a helpful facility management and safety assistant. 
-Use ONLY the information in the provided context to answer the question. 
+You are a helpful facility management and safety assistant.
+Use ONLY the information in the provided context to answer the question.
 
 Guidelines:
-- If the context contains relevant details (even if wording is slightly different), rephrase and explain clearly. 
-- For layman questions, use simple language. 
-- For technical questions, give exact values (temperature, pressure, size) as shown. 
-- If the context has absolutely no relevant information, then and only then reply: 
-  "I cannot find the answer in the provided documents." 
-- Do NOT guess or add outside info. Stay grounded in the context. 
+- If the context contains relevant details, rephrase and explain clearly.
+- For layman questions, use simple language.
+- For technical questions, give exact values (temperature, pressure, size).
+- If no relevant information exists, reply: "I cannot find the answer in the provided documents."
+- Do NOT guess or add outside info.
 
 Context:
 {context}
@@ -105,7 +104,14 @@ Question:
 Answer:
 """)
 
-        llm = ChatOllama(model="phi3:mini", temperature=0.1)
+        # ✅ Use StableLM Zephyr 3B (fast LLM for small systems)
+        llm = ChatOllama(
+            model="stablelm-zephyr:3b",
+            temperature=0.1,
+            num_ctx=2048,       # shorter context for speed
+            num_predict=128     # limit output tokens
+        )
+
         document_chain = create_stuff_documents_chain(llm, prompt_template)
         retrieval_chain = create_retrieval_chain(retriever, document_chain)
         return retrieval_chain
@@ -144,19 +150,11 @@ def chat():
 
     # 3. RAG (PDFs + CSV)
     try:
-        # 🔧 Normalize layman question before retrieval
         normalized_question = normalize_question(user_message)
-
         response = retrieval_chain.invoke({"input": normalized_question})
 
-        # Debug: show retrieved context
-        print("🔎 Retrieved context:")
-        if "context" in response:
-            print(response["context"])
-        else:
-            print("No context returned")
-
-        return jsonify({"response": response["answer"] + " (📄 RAG: CSV+PDF)"})
+        print("🔎 Retrieved context:", response.get("context", "No context returned"))
+        return jsonify({"response": response["answer"] + " (📄 RAG)"})
     except Exception as e:
         return jsonify({"response": f"❌ An error occurred: {e}"})
 
