@@ -1,18 +1,20 @@
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
-from langchain_ollama import ChatOllama   # ✅ LLM via Ollama
+from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 from vector import initialize_vector_store
-from langchain_huggingface import HuggingFaceEmbeddings  # ✅ MiniLM Embeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 import pandas as pd
 import numpy as np
+from datetime import datetime, timedelta
+from uuid import uuid4
 
 app = Flask(__name__)
 CORS(app)
 
-# ----------------- Load CSV -----------------
+# ----------------- CSV -----------------
 CSV_FILE = "facility_maintenance_safety_guidelines_realtime.csv"
 try:
     df = pd.read_csv(CSV_FILE)
@@ -20,11 +22,9 @@ except FileNotFoundError:
     df = None
     print(f"⚠️ CSV file '{CSV_FILE}' not found. Exact/fuzzy matching disabled.")
 
-# ----------------- Embeddings for fuzzy matching -----------------
-# ✅ Use HuggingFace MiniLM instead of sentence-transformers
+# ----------------- Embeddings -----------------
 embeddings_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-# Precompute embeddings for CSV Q&A
 question_embeddings = []
 if df is not None:
     print("✅ Precomputing embeddings for CSV questions...")
@@ -32,15 +32,12 @@ if df is not None:
         emb = embeddings_model.embed_query(row["Question"])
         question_embeddings.append((row["Question"], row["Answer"], emb))
 
-
-# ----------------- CSV Matching Helpers -----------------
 def check_exact_match(user_message: str):
     if df is not None:
         row = df[df["Question"].str.lower().str.strip() == user_message.lower().strip()]
         if not row.empty:
             return row.iloc[0]["Answer"]
     return None
-
 
 def semantic_fuzzy_match(user_message: str, threshold=0.8):
     if not question_embeddings:
@@ -49,9 +46,7 @@ def semantic_fuzzy_match(user_message: str, threshold=0.8):
     best_score = 0
     best_answer = None
     for q, a, emb in question_embeddings:
-        score = np.dot(query_embedding, emb) / (
-            np.linalg.norm(query_embedding) * np.linalg.norm(emb)
-        )
+        score = np.dot(query_embedding, emb) / (np.linalg.norm(query_embedding)*np.linalg.norm(emb))
         if score > best_score:
             best_score = score
             best_answer = a
@@ -59,8 +54,6 @@ def semantic_fuzzy_match(user_message: str, threshold=0.8):
         return best_answer
     return None
 
-
-# ----------------- Question Normalization Helper -----------------
 def normalize_question(q: str) -> str:
     replacements = {
         "know when to": "how does it",
@@ -74,8 +67,7 @@ def normalize_question(q: str) -> str:
         q_norm = q_norm.replace(k, v)
     return q_norm
 
-
-# ----------------- RAG Pipeline -----------------
+# ----------------- RAG -----------------
 def initialize_rag_pipeline():
     try:
         vector_store = initialize_vector_store()
@@ -104,12 +96,11 @@ Question:
 Answer:
 """)
 
-        # ✅ Use StableLM Zephyr 3B (fast LLM for small systems)
         llm = ChatOllama(
-            model="stablelm-zephyr:3b",
+            model="mistral:7b",
             temperature=0.1,
-            num_ctx=2048,       # shorter context for speed
-            num_predict=128     # limit output tokens
+            num_ctx=4096,
+            num_predict=256
         )
 
         document_chain = create_stuff_documents_chain(llm, prompt_template)
@@ -119,45 +110,75 @@ Answer:
         print(f"❌ Error initializing RAG pipeline: {e}")
         return None
 
-
 retrieval_chain = initialize_rag_pipeline()
 
+# ----------------- Chat Sessions -----------------
+chat_sessions = []  # list of dicts: {id, created_at, messages: [{"user":..., "bot":...}]}
 
-# ----------------- Flask Routes -----------------
+def create_new_chat():
+    new_chat = {
+        "id": str(uuid4()),
+        "created_at": datetime.now(),
+        "messages": []
+    }
+    chat_sessions.insert(0, new_chat)  # newest first
+    cleanup_chats()
+    return new_chat
+
+def cleanup_chats():
+    global chat_sessions
+    cutoff = datetime.now() - timedelta(days=1)
+    chat_sessions = [c for c in chat_sessions if c["created_at"] > cutoff]
+
+def add_message(chat_id, user_msg, bot_resp):
+    for chat in chat_sessions:
+        if chat["id"] == chat_id:
+            chat["messages"].append({"user": user_msg, "bot": bot_resp})
+            break
+    cleanup_chats()
+
+# ----------------- Routes -----------------
 @app.route("/")
 def home():
     return render_template("index.html")
 
+@app.route("/new_chat", methods=["POST"])
+def new_chat():
+    chat = create_new_chat()
+    return jsonify({"id": chat["id"]})
 
-@app.route("/chat", methods=["POST"])
-def chat():
-    if not retrieval_chain:
-        return jsonify({"response": "Chatbot is not ready. Please check the server logs."})
+@app.route("/get_chats", methods=["GET"])
+def get_chats():
+    cleanup_chats()
+    previews = []
+    for chat in chat_sessions:
+        first_question = chat["messages"][0]["user"] if chat["messages"] else ""
+        previews.append({
+            "id": chat["id"],
+            "first_question": first_question,
+            "created_at": chat["created_at"].isoformat()
+        })
+    return jsonify(previews)
 
+@app.route("/chat/<chat_id>", methods=["POST"])
+def chat_in_session(chat_id):
     user_message = request.json.get("message")
     if not user_message:
         return jsonify({"response": "No message received."})
 
-    # 1. Exact Match (CSV)
+    # Exact Match
     answer = check_exact_match(user_message)
-    if answer:
-        return jsonify({"response": answer })
-
-    # 2. Fuzzy Match (CSV)
-    fuzzy_answer = semantic_fuzzy_match(user_message, threshold=0.8)
-    if fuzzy_answer:
-        return jsonify({"response": fuzzy_answer })
-
-    # 3. RAG (PDFs + CSV)
-    try:
+    # Fuzzy Match
+    if not answer:
+        answer = semantic_fuzzy_match(user_message)
+    # RAG
+    if not answer:
         normalized_question = normalize_question(user_message)
         response = retrieval_chain.invoke({"input": normalized_question})
+        answer = response["answer"] + " (📄 RAG)"
 
-        print("🔎 Retrieved context:", response.get("context", "No context returned"))
-        return jsonify({"response": response["answer"] + " (📄 RAG)"})
-    except Exception as e:
-        return jsonify({"response": f"❌ An error occurred: {e}"})
-
+    add_message(chat_id, user_message, answer)
+    return jsonify({"response": answer})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
